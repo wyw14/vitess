@@ -17,12 +17,14 @@ limitations under the License.
 package vdiff
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"html/template"
 	"io"
 	"math"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -34,6 +36,7 @@ import (
 	"vitess.io/vitess/go/cmd/vtctldclient/command/vreplication/common"
 	"vitess.io/vitess/go/protoutil"
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/vtctl/vtctldclient"
 	"vitess.io/vitess/go/vt/vtctl/workflow"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vttablet/tabletmanager/vdiff"
@@ -85,6 +88,11 @@ var (
 		Arg       string
 		Verbose   bool
 		NoSamples bool
+	}{}
+
+	compareOptions = struct {
+		FromUUID uuid.UUID
+		ToUUID   uuid.UUID
 	}{}
 
 	stopOptions = struct {
@@ -224,6 +232,49 @@ vtctldclient --server localhost:15999 vdiff --workflow commerce2customer --targe
 			return nil
 		},
 		RunE: commandShow,
+	}
+
+	// compare makes two VDiffShow gRPC calls to a vtctld and aligns the
+	// already completed reports locally; it never creates or runs a VDiff.
+	compare = &cobra.Command{
+		Use:   "compare <from-uuid> <to-uuid>",
+		Short: "Compare two completed VDiffs of the same workflow, aligned by shard and table.",
+		Long: `Compare two already completed VDiffs of the same workflow by aligning their
+results by target shard and table. For every table on a shard the matching,
+mismatched, extra source row and extra target row counts are shown with their
+values in the first VDiff (from), the second VDiff (to) and the difference
+between them (to - from). Tables that only appear in one of the two VDiffs are
+marked as new or removed.
+
+This command only reads the existing VDiff reports: it does not create, resume
+or re-run a VDiff, it does not modify the replication workflow in any way and
+it never reads or outputs sample row content -- only the scalar row counters
+are compared. The comparison is rejected when the two VDiffs target different
+keyspaces or workflows, when either VDiff is not completed or when their
+target shard coverage does not match.`,
+		Example: `vtctldclient --server localhost:15999 vdiff --workflow commerce2customer --target-keyspace customer compare a037a9e2-5628-11ee-8c99-0242ac120002 b3f59678-5241-11ee-be56-0242ac120002
+vtctldclient --server :15999 vdiff --workflow commerce2customer --target-keyspace customer compare a037a9e2-5628-11ee-8c99-0242ac120002 b3f59678-5241-11ee-be56-0242ac120002 --format json`,
+		SilenceUsage:          true,
+		DisableFlagsInUseLine: true,
+		Aliases:               []string{"Compare"},
+		Args:                  cobra.ExactArgs(2),
+		PreRunE: func(cmd *cobra.Command, args []string) error {
+			fromUUID, err := uuid.Parse(args[0])
+			if err != nil {
+				return fmt.Errorf("invalid UUID provided for the first (from) VDiff: %v", err)
+			}
+			toUUID, err := uuid.Parse(args[1])
+			if err != nil {
+				return fmt.Errorf("invalid UUID provided for the second (to) VDiff: %v", err)
+			}
+			if fromUUID == toUUID {
+				return errors.New("the two VDiff UUIDs to compare must be different")
+			}
+			compareOptions.FromUUID = fromUUID
+			compareOptions.ToUUID = toUUID
+			return nil
+		},
+		RunE: commandCompare,
 	}
 
 	// stop makes a VDiffStop gRPC call to a vtctld.
@@ -660,6 +711,115 @@ func commandShow(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// fetchVDiffSummary reads the existing report for one completed VDiff and
+// builds its summary. Sample rows are never fetched as the comparison only
+// uses the scalar counters; this does not run or modify anything.
+func fetchVDiffSummary(ctx context.Context, client vtctldclient.VtctldClient, keyspace, workflowName, vdiffUUID string) (*workflow.Summary, error) {
+	// We always pass NoSamples: compare never reads or outputs sample rows.
+	resp, err := client.VDiffShow(ctx, &vtctldatapb.VDiffShowRequest{
+		Workflow:       workflowName,
+		TargetKeyspace: keyspace,
+		Arg:            vdiffUUID,
+		NoSamples:      true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Verbose is required so that the per-shard/per-table counters are always
+	// included, even when the run has no mismatches.
+	return workflow.BuildSummary(keyspace, workflowName, vdiffUUID, resp, true)
+}
+
+func commandCompare(cmd *cobra.Command, args []string) error {
+	format, err := common.GetOutputFormat(cmd)
+	if err != nil {
+		return err
+	}
+	cli.FinishedParsing(cmd)
+
+	keyspace := common.BaseOptions.TargetKeyspace
+	workflowName := common.BaseOptions.Workflow
+	ctx := common.GetCommandCtx()
+	client := common.GetClient()
+
+	fromSummary, err := fetchVDiffSummary(ctx, client, keyspace, workflowName, compareOptions.FromUUID.String())
+	if err != nil {
+		return err
+	}
+	toSummary, err := fetchVDiffSummary(ctx, client, keyspace, workflowName, compareOptions.ToUUID.String())
+	if err != nil {
+		return err
+	}
+
+	report, err := workflow.CompareVDiffSummaries(fromSummary, toSummary)
+	if err != nil {
+		return err
+	}
+
+	return renderComparison(cmd.OutOrStdout(), format, report)
+}
+
+var comparisonMetricNames = []string{
+	"Matching Rows",
+	"Mismatched Rows",
+	"Extra Rows Source",
+	"Extra Rows Target",
+}
+
+func formatSignedDelta(delta int64) string {
+	if delta > 0 {
+		return "+" + strconv.FormatInt(delta, 10)
+	}
+	// strconv already renders zero as "0" and negative values with a "-".
+	return strconv.FormatInt(delta, 10)
+}
+
+func buildComparisonTable(report *workflow.VDiffComparisonReport) string {
+	lines := [][]string{{"Shard", "Table", "Status", "Metric", "From", "To", "Delta"}}
+	for _, shard := range report.Shards {
+		for _, table := range shard.Tables {
+			diffs := []workflow.VDiffCounterDiff{
+				table.MatchingRows,
+				table.MismatchedRows,
+				table.ExtraRowsSource,
+				table.ExtraRowsTarget,
+			}
+			for i, diff := range diffs {
+				lines = append(lines, []string{
+					shard.Shard,
+					table.Table,
+					string(table.Status),
+					comparisonMetricNames[i],
+					strconv.FormatInt(diff.From, 10),
+					strconv.FormatInt(diff.To, 10),
+					formatSignedDelta(diff.Delta),
+				})
+			}
+		}
+	}
+	return gotabulate.Create(lines).Render("grid")
+}
+
+func renderComparison(out io.Writer, format string, report *workflow.VDiffComparisonReport) error {
+	if format == "json" {
+		jsonText, err := cli.MarshalJSONPretty(report)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(out, string(jsonText))
+		return nil
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "VDiff Comparison for %s.%s\n", report.Keyspace, report.Workflow)
+	fmt.Fprintf(&sb, "From: %s (state: %s, completed at %s)\n", report.From.UUID, report.From.State, report.From.CompletedAt)
+	fmt.Fprintf(&sb, "To:   %s (state: %s, completed at %s)\n\n", report.To.UUID, report.To.State, report.To.CompletedAt)
+	sb.WriteString(buildComparisonTable(report))
+	sb.WriteByte('\n')
+	fmt.Fprintln(out, sb.String())
+	return nil
+}
+
 func commandStop(cmd *cobra.Command, args []string) error {
 	format, err := common.GetOutputFormat(cmd)
 	if err != nil {
@@ -714,6 +874,10 @@ func registerCommands(root *cobra.Command) {
 	show.Flags().BoolVar(&showOptions.Verbose, "verbose", false, "Show verbose output in summaries")
 	show.Flags().BoolVar(&showOptions.NoSamples, "no-samples", false, "Strip the per-table diff report's row-sample arrays (keeping the scalar counters). Useful for large diffs where the samples can exceed gRPC message limits.")
 	base.AddCommand(show)
+
+	// Compare takes no flags of its own beyond the common ones: it always
+	// reads the existing reports without sample rows and never runs a VDiff.
+	base.AddCommand(compare)
 
 	stop.Flags().StringSliceVar(&stopOptions.TargetShards, "target-shards", nil, "The target shards to stop the vdiff on; default is all shards.")
 	base.AddCommand(stop)
