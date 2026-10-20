@@ -75,6 +75,12 @@ type tabletHealthCheck struct {
 	// LastError is the error we last saw when trying to get the
 	// tablet's healthcheck.
 	LastError error
+	// healthVersion is a monotonically increasing version of the
+	// health record: it is bumped on every processed StreamHealth
+	// response, stream error and healthcheck timeout. It is exposed
+	// through TabletHealth.HealthVersion and must only be accessed
+	// while holding connMu.
+	healthVersion uint64
 	// possibly delete both these
 	loggedServingState    bool
 	lastResponseTimestamp time.Time // timestamp of the last healthcheck response
@@ -102,7 +108,16 @@ func (thc *tabletHealthCheck) SimpleCopy() *TabletHealth {
 		LastError:            thc.LastError,
 		PrimaryTermStartTime: thc.PrimaryTermStartTime,
 		Serving:              thc.Serving,
+		HealthVersion:        thc.healthVersion,
 	}
+}
+
+// bumpHealthVersion atomically increments the monotonically increasing
+// health version. It must not be called while already holding connMu.
+func (thc *tabletHealthCheck) bumpHealthVersion() {
+	thc.connMu.Lock()
+	defer thc.connMu.Unlock()
+	thc.healthVersion++
 }
 
 // setServingState sets the tablet state to the given value.
@@ -219,6 +234,8 @@ func (thc *tabletHealthCheck) processResponse(hc *HealthCheckImpl, shr *query.St
 	thc.PrimaryTermStartTime = shr.PrimaryTermStartTimestamp
 	thc.Stats = shr.RealtimeStats
 	thc.LastError = healthErr
+	// Every healthcheck response carries a new version of the record.
+	thc.healthVersion++
 	reason := "healthCheck update"
 	if healthErr != nil {
 		reason = "healthCheck update error: " + healthErr.Error()
@@ -329,6 +346,9 @@ func (thc *tabletHealthCheck) checkConn(hc *HealthCheckImpl) {
 				hc.deleteTablet(thc.Tablet)
 				return
 			}
+			// The stream failure is a new version of the record: bump the
+			// version before the updateHealth SimpleCopy snapshots it.
+			thc.bumpHealthVersion()
 			// trivialUpdate = false because this is an error
 			// up = false because we did not get a healthy response
 			hc.updateHealth(thc, thc.Target, false, false)
@@ -339,6 +359,8 @@ func (thc *tabletHealthCheck) checkConn(hc *HealthCheckImpl) {
 		if timedout.Load() {
 			thc.connMu.Lock()
 			thc.LastError = fmt.Errorf("healthcheck timed out (latest %v)", thc.lastResponseTimestamp)
+			// A timeout produces a new (unavailable) version of the record.
+			thc.healthVersion++
 			logServingChange := thc.setServingState(false, thc.LastError.Error())
 			target := thc.Target
 			thc.connMu.Unlock()

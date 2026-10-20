@@ -24,6 +24,7 @@ import (
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/vtctld"
 	"vitess.io/vitess/go/vt/vtenv"
+	"vitess.io/vitess/go/vt/vttablet/tmclient"
 )
 
 var (
@@ -73,6 +74,14 @@ func run(cmd *cobra.Command, args []string) error {
 
 	// Register http debug/health
 	vtctld.RegisterDebugHealthHandler(ts)
+
+	// Register the tablet health aggregation API. Tablets are probed
+	// through the tabletmanager Ping RPC with a per-tablet deadline, so an
+	// unreachable tablet cannot block the aggregation of other shards.
+	vtctld.RegisterTabletHealthHandler(
+		ts,
+		vtctld.NewTabletManagerHealthProber(tmclient.NewTabletManagerClient()),
+	)
 
 	// Start schema manager service.
 	initSchema(cmd.Context())

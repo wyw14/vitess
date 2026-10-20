@@ -274,7 +274,7 @@ func TestHealthCheck(t *testing.T) {
 	input <- shr
 	result = <-resultChan
 	// Ignore LastError because we're going to check it separately.
-	utils.MustMatchFn(".LastError", ".Conn")(t, want, result, "Wrong TabletHealth data")
+	utils.MustMatchFn(".LastError", ".Conn", ".HealthVersion")(t, want, result, "Wrong TabletHealth data")
 	require.Error(t, result.LastError, "vttablet error: some error")
 	testChecksum(t, 1027934207, hc.stateChecksum()) // unchanged
 
@@ -528,7 +528,7 @@ func TestHealthCheckStreamError(t *testing.T) {
 	}
 	result = <-resultChan
 	// Ignore LastError because we're going to check it separately.
-	utils.MustMatchFn(".LastError", ".Conn")(t, want, result, "Wrong TabletHealth data")
+	utils.MustMatchFn(".LastError", ".Conn", ".HealthVersion")(t, want, result, "Wrong TabletHealth data")
 	require.Error(t, result.LastError, "some stream error")
 	// tablet should be removed from healthy list
 	a := hc.GetHealthyTabletStats(&querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_REPLICA})
@@ -592,7 +592,7 @@ func TestHealthCheckErrorOnPrimary(t *testing.T) {
 	}
 	result = <-resultChan
 	// Ignore LastError because we're going to check it separately.
-	utils.MustMatchFn(".LastError", ".Conn")(t, want, result, "Wrong TabletHealth data")
+	utils.MustMatchFn(".LastError", ".Conn", ".HealthVersion")(t, want, result, "Wrong TabletHealth data")
 	require.Error(t, result.LastError, "some stream error")
 	// tablet should be removed from healthy list
 	a := hc.GetHealthyTabletStats(&querypb.Target{Keyspace: "k", Shard: "s", TabletType: topodatapb.TabletType_PRIMARY})
@@ -2021,7 +2021,7 @@ func createTestTablet(uid uint32, cell, host string) *topodatapb.Tablet {
 	return tablet
 }
 
-var mustMatch = utils.MustMatchFn(".Conn" /* ignored fields*/)
+var mustMatch = utils.MustMatchFn(".Conn", ".HealthVersion" /* ignored fields*/)
 
 func deleteCellsAlias(t *testing.T, ts *topo.Server, alias string) {
 	if err := ts.DeleteCellsAlias(t.Context(), alias); err != nil {

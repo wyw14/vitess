@@ -40,6 +40,12 @@ type TabletHealth struct {
 	PrimaryTermStartTime int64
 	LastError            error
 	Serving              bool
+	// HealthVersion is the monotonically increasing version of this health
+	// record. It starts at 0 (no health update seen yet) and is incremented
+	// once for every StreamHealth response, stream error or healthcheck
+	// timeout observed for the tablet. Consumers such as the tablet health
+	// aggregation use it to tell which of two records carries fresher data.
+	HealthVersion uint64
 }
 
 func (th *TabletHealth) MarshalJSON() ([]byte, error) {
@@ -50,6 +56,7 @@ func (th *TabletHealth) MarshalJSON() ([]byte, error) {
 		PrimaryTermStartTime int64
 		Stats                *query.RealtimeStats
 		LastError            error
+		HealthVersion        uint64
 	}{
 		Tablet:               th.Tablet,
 		Target:               th.Target,
@@ -57,6 +64,7 @@ func (th *TabletHealth) MarshalJSON() ([]byte, error) {
 		PrimaryTermStartTime: th.PrimaryTermStartTime,
 		Stats:                th.Stats,
 		LastError:            th.LastError,
+		HealthVersion:        th.HealthVersion,
 	})
 }
 
@@ -67,6 +75,8 @@ func (th *TabletHealth) DeepEqual(other *TabletHealth) bool {
 		proto.Equal(th.Target, other.Target) &&
 		th.Serving == other.Serving &&
 		th.PrimaryTermStartTime == other.PrimaryTermStartTime &&
+		// HealthVersion is intentionally not compared: it is record freshness
+		// metadata, and callers use DeepEqual to detect equivalent health state.
 		proto.Equal(th.Stats, other.Stats) &&
 		((th.LastError == nil && other.LastError == nil) ||
 			(th.LastError != nil && other.LastError != nil && th.LastError.Error() == other.LastError.Error()))
