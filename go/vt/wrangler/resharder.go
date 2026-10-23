@@ -94,6 +94,13 @@ func (wr *Wrangler) Reshard(ctx context.Context, keyspace, workflow string, sour
 	if err := rs.createStreams(ctx); err != nil {
 		return vterrors.Wrap(err, "createStreams")
 	}
+	// The vreplication streams now exist and the initial copy has
+	// started (or will start once -auto_start runs). Persist the
+	// first, versioned checkpoint so that a paused or restarted
+	// workflow can be recovered without repeating the cutover.
+	if err := rs.recordCopyCheckpoint(ctx); err != nil {
+		return vterrors.Wrap(err, "recordCopyCheckpoint")
+	}
 
 	if autoStart {
 		if err := rs.startStreams(ctx); err != nil {

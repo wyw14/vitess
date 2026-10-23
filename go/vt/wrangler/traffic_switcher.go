@@ -543,6 +543,22 @@ func (wr *Wrangler) SwitchWrites(ctx context.Context, targetKeyspace, workflowNa
 		defer targetUnlock(&err)
 	}
 
+	// Load (or bootstrap) the versioned workflow checkpoint. It records
+	// how far the cutover progressed so that a paused or restarted
+	// workflow resumes instead of switching traffic a second time.
+	// Dry runs never persist anything.
+	var cpi *topo.ReshardCheckpointInfo
+	if !dryRun {
+		cpi, err = ts.loadOrInitCheckpoint(ctx)
+		if err != nil {
+			return handleError("failed to load the workflow checkpoint", err)
+		}
+		if cpi.Stage == topo.ReshardStageComplete {
+			ts.Logger().Warningf("Traffic has already been switched for workflow %s, nothing to do here", ts.WorkflowName())
+			return ts.id, sw.logs(), nil
+		}
+	}
+
 	// Find out if the target is using any sequence tables for auto_increment
 	// value generation. If so, then we'll need to ensure that they are
 	// initialized properly before allowing new writes on the target.
@@ -563,7 +579,19 @@ func (wr *Wrangler) SwitchWrites(ctx context.Context, targetKeyspace, workflowNa
 	if err != nil {
 		return handleError(fmt.Sprintf("failed to read journal in the %s keyspace", ts.SourceKeyspaceName()), err)
 	}
-	if !journalsExist {
+	// The checkpoint reaching the switch_traffic stage independently proves
+	// that a previous attempt crossed the point of no return. In that
+	// case we take the journal-recovery path even if the journal
+	// records themselves cannot be read, so the cutover is never
+	// performed twice.
+	cutoverReached := false
+	if cpi != nil {
+		if rank, ok := cpi.StageRank(); ok {
+			switchTrafficRank, _ := vreplication.WorkflowStageSwitchTraffic.Rank()
+			cutoverReached = rank >= switchTrafficRank
+		}
+	}
+	if !journalsExist && !cutoverReached {
 		ts.Logger().Infof("No previous journals were found. Proceeding normally.")
 		sm, err := workflow.BuildLegacyStreamMigrator(ctx, ts, cancel, wr.env.Parser())
 		if err != nil {
@@ -571,6 +599,7 @@ func (wr *Wrangler) SwitchWrites(ctx context.Context, targetKeyspace, workflowNa
 		}
 		if cancel {
 			sw.cancelMigration(ctx, sm)
+			ts.rollbackCheckpointToCopy(ctx)
 			return 0, sw.logs(), nil
 		}
 
@@ -583,12 +612,14 @@ func (wr *Wrangler) SwitchWrites(ctx context.Context, targetKeyspace, workflowNa
 				}
 			}
 			sw.cancelMigration(ctx, sm)
+			ts.rollbackCheckpointToCopy(ctx)
 			return handleError("failed to stop the workflow streams", err)
 		}
 
 		ts.Logger().Infof("Stopping source writes")
 		if err := sw.stopSourceWrites(ctx); err != nil {
 			sw.cancelMigration(ctx, sm)
+			ts.rollbackCheckpointToCopy(ctx)
 			return handleError(fmt.Sprintf("failed to stop writes in the %s keyspace", ts.SourceKeyspaceName()), err)
 		}
 
@@ -599,6 +630,7 @@ func (wr *Wrangler) SwitchWrites(ctx context.Context, targetKeyspace, workflowNa
 			for cnt := 1; cnt <= lockTablesCycles; cnt++ {
 				if err := ts.executeLockTablesOnSource(ctx); err != nil {
 					sw.cancelMigration(ctx, sm)
+					ts.rollbackCheckpointToCopy(ctx)
 					return handleError(fmt.Sprintf("failed to execute LOCK TABLES (attempt %d of %d) on sources", cnt, lockTablesCycles), err)
 				}
 				// No need to UNLOCK the tables as the connection was closed once the locks were acquired
@@ -607,27 +639,44 @@ func (wr *Wrangler) SwitchWrites(ctx context.Context, targetKeyspace, workflowNa
 			}
 		}
 
+		// Source writes are stopped: record the catchup stage so
+		// that a restart before the journal is created does not run
+		// the cutover twice.
+		if cpi != nil {
+			var cpErr error
+			cpi, cpErr = ts.saveCheckpoint(ctx, vreplication.WorkflowStageCatchup, nil)
+			if cpErr != nil {
+				sw.cancelMigration(ctx, sm)
+				ts.rollbackCheckpointToCopy(ctx)
+				return handleError("failed to save the workflow checkpoint", cpErr)
+			}
+		}
+
 		ts.Logger().Infof("Waiting for streams to catchup")
 		if err := sw.waitForCatchup(ctx, timeout); err != nil {
 			sw.cancelMigration(ctx, sm)
+			ts.rollbackCheckpointToCopy(ctx)
 			return handleError("failed to sync up replication between the source and target", err)
 		}
 
 		ts.Logger().Infof("Migrating streams")
 		if err := sw.migrateStreams(ctx, sm); err != nil {
 			sw.cancelMigration(ctx, sm)
+			ts.rollbackCheckpointToCopy(ctx)
 			return handleError("failed to migrate the workflow streams", err)
 		}
 
 		ts.Logger().Infof("Resetting sequences")
 		if err := sw.resetSequences(ctx); err != nil {
 			sw.cancelMigration(ctx, sm)
+			ts.rollbackCheckpointToCopy(ctx)
 			return handleError("failed to reset the sequences", err)
 		}
 
 		ts.Logger().Infof("Creating reverse streams")
 		if err := sw.createReverseVReplication(ctx); err != nil {
 			sw.cancelMigration(ctx, sm)
+			ts.rollbackCheckpointToCopy(ctx)
 			return handleError("failed to create the reverse vreplication streams", err)
 		}
 
@@ -641,6 +690,7 @@ func (wr *Wrangler) SwitchWrites(ctx context.Context, targetKeyspace, workflowNa
 			defer cancel()
 			if err := sw.initializeTargetSequences(initSeqCtx, sequenceMetadata); err != nil {
 				sw.cancelMigration(ctx, sm)
+				ts.rollbackCheckpointToCopy(ctx)
 				return handleError(fmt.Sprintf("failed to initialize the sequences used in the %s keyspace", ts.TargetKeyspaceName()), err)
 			}
 		}
@@ -648,10 +698,24 @@ func (wr *Wrangler) SwitchWrites(ctx context.Context, targetKeyspace, workflowNa
 		if cancel {
 			return handleError("invalid cancel", errors.New("traffic switching has reached the point of no return, cannot cancel"))
 		}
-		ts.Logger().Infof("Journals were found. Completing the left over steps.")
+		ts.Logger().Infof("Journals (or a completed cutover checkpoint) were found. Completing the left over steps.")
 		// Need to gather positions in case all journals were not created.
 		if err := ts.gatherPositions(ctx); err != nil {
 			return handleError("failed to gather replication positions", err)
+		}
+	}
+
+	// Record the switch_traffic stage before creating the journals:
+	// this is the point of no return, and the persisted marker lets
+	// a restarted process take the journal-recovery path even if
+	// the journal insert itself did not complete.
+	if cpi != nil {
+		var cpErr error
+		cpi, cpErr = ts.saveCheckpoint(ctx, vreplication.WorkflowStageSwitchTraffic, func(cp *topo.ReshardCheckpoint) {
+			cp.JournalID = ts.id
+		})
+		if cpErr != nil {
+			return handleError("failed to save the workflow checkpoint", cpErr)
 		}
 	}
 
@@ -660,11 +724,34 @@ func (wr *Wrangler) SwitchWrites(ctx context.Context, targetKeyspace, workflowNa
 	if err := sw.createJournals(ctx, sourceWorkflows); err != nil {
 		return handleError("failed to create the journal", err)
 	}
-	if err := sw.allowTargetWrites(ctx); err != nil {
-		return handleError(fmt.Sprintf("failed to allow writes in the %s keyspace", ts.TargetKeyspaceName()), err)
+	// Only perform the cutover steps that were not already
+	// completed by a previous attempt: a resumed workflow must not
+	// switch traffic twice.
+	if cpi == nil || !cpi.WritesAllowed {
+		if err := sw.allowTargetWrites(ctx); err != nil {
+			return handleError(fmt.Sprintf("failed to allow writes in the %s keyspace", ts.TargetKeyspaceName()), err)
+		}
+		if cpi != nil {
+			cpi, err = ts.saveCheckpoint(ctx, vreplication.WorkflowStageSwitchTraffic, func(cp *topo.ReshardCheckpoint) {
+				cp.WritesAllowed = true
+			})
+			if err != nil {
+				return handleError("failed to save the workflow checkpoint", err)
+			}
+		}
 	}
-	if err := sw.changeRouting(ctx); err != nil {
-		return handleError("failed to update the routing rules", err)
+	if cpi == nil || !cpi.TrafficSwitched {
+		if err := sw.changeRouting(ctx); err != nil {
+			return handleError("failed to update the routing rules", err)
+		}
+		if cpi != nil {
+			cpi, err = ts.saveCheckpoint(ctx, vreplication.WorkflowStageSwitchTraffic, func(cp *topo.ReshardCheckpoint) {
+				cp.TrafficSwitched = true
+			})
+			if err != nil {
+				return handleError("failed to save the workflow checkpoint", err)
+			}
+		}
 	}
 	if err := sw.streamMigraterfinalize(ctx, ts, sourceWorkflows); err != nil {
 		return handleError("failed to finalize the traffic switch", err)
@@ -677,6 +764,15 @@ func (wr *Wrangler) SwitchWrites(ctx context.Context, targetKeyspace, workflowNa
 
 	if err := sw.freezeTargetVReplication(ctx); err != nil {
 		return handleError(fmt.Sprintf("failed to freeze the workflow in the %s keyspace", ts.TargetKeyspaceName()), err)
+	}
+
+	// The cutover fully completed: remember it so any later
+	// pause/resume is a no-op.
+	if cpi != nil {
+		cpi, err = ts.saveCheckpoint(ctx, vreplication.WorkflowStageComplete, nil)
+		if err != nil {
+			return handleError("failed to save the workflow checkpoint", err)
+		}
 	}
 
 	return ts.id, sw.logs(), nil
@@ -736,6 +832,11 @@ func (wr *Wrangler) DropTargets(ctx context.Context, targetKeyspace, workflow st
 	}
 	if err := wr.dropArtifacts(ctx, keepRoutingRules, sw); err != nil {
 		return nil, err
+	}
+	if !dryRun {
+		if err := ts.deleteWorkflowCheckpoint(ctx); err != nil {
+			return nil, err
+		}
 	}
 	if err := ts.TopoServer().RebuildSrvVSchema(ctx, nil); err != nil {
 		return nil, err
